@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import os,re,sys,time,random,requests
+from concurrent.futures import ThreadPoolExecutor
 try:
     from patchright.sync_api import sync_playwright
     USING_PATCHRIGHT = True
@@ -15,6 +16,7 @@ EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，�
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用, 必填
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选，通知
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选    
+BARK_DEVICE_KEY = os.environ.get("BARK_DEVICE_KEY") or ""
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -58,7 +60,25 @@ def get_current_ip(proxy_server=None):
         log(f"❌ 获取出口IP失败: {e}")
         return "获取失败"
 
-def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
+def send_message(status, old_due, new_due, current_ip="未知"):
+    """并发发送 Telegram 和 Bark 续期通知"""
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        futures = [
+            executor.submit(
+                send_tg_message, status, old_due, new_due, current_ip
+            ),
+            executor.submit(
+                send_bark_message, status, old_due, new_due, current_ip
+            ),
+        ]
+
+        for future in futures:
+            try:
+                future.result()
+            except Exception as e:
+                log(f"❌ 通知任务异常: {e}")
+
+def send_tg_message(status, old_due, new_due, current_ip="未知"):
     """发送 Telegram 通知"""
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         log("⚠️ Telegram 未配置，跳过通知")
@@ -101,6 +121,66 @@ def send_telegram_notification(status, old_due, new_due, current_ip="未知"):
             return False
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
+        return False
+
+def send_bark_message(status, old_due, new_due, current_ip="未知"):
+    """发送 Bark 通知"""
+    if not BARK_DEVICE_KEY:
+        log("⚠️ Bark 未配置，跳过通知")
+        return False
+
+    # 获取北京时间
+    local_time = time.gmtime(time.time() + 8 * 3600)
+    now = time.strftime("%Y-%m-%d %H:%M:%S", local_time)
+
+    # 邮箱脱敏
+    if '@' in EMAIL:
+        name, domain = EMAIL.split('@', 1)
+        if len(name) > 4:
+            masked_email = f"{name[:2]}****{name[-2:]}@{domain}"
+        else:
+            masked_email = f"{name}@{domain}"
+    else:
+        masked_email = EMAIL[:2] + '****'
+
+    text = (
+        f"🎉 HidenCloud 续期通知\n\n"
+        f"{status}\n"
+        f"👤 账号: {masked_email}\n"
+        f"📅 续期前到期：{old_due}\n"
+        f"📅 续期后到期：{new_due}\n"
+        f"🌐 续期使用IP: {current_ip}\n"
+        f"🕒 续期时间：{now}"
+    )
+
+    try:
+        url = "https://api.day.app/push"
+        payload = {
+            "title": "HidenCloud 续期报告",
+            "body": text,
+            "group": "HidenCloud",
+            "icon": "https://www.hidencloud.com/assets/images/favicon.ico",
+            "device_key": BARK_DEVICE_KEY
+        }
+
+        response = requests.post(
+            url,
+            json=payload,
+            headers={
+                "Content-Type": "application/json; charset=utf-8"
+            },
+            timeout=10
+        )
+
+        if response.status_code == 200:
+            log("✅ Bark 通知发送成功")
+            return True
+        else:
+            log(f"❌ Bark 通知失败: {response.text}")
+            return False
+
+    except Exception as e:
+        log(f"❌ Bark 通知异常: {e}")
         return False
 
 def _get_turnstile_token(page):
@@ -483,7 +563,7 @@ def login(page):
         if not _is_logged_in(page):
             log("❌ 登录失败。")
             status = "❌ 登录失败"
-            send_telegram_notification(status)  # 发送 Telegram 通知 
+            send_message(status)  # 发送 Telegram 通知 
             return False
         log(f"✅ 账号密码登录成功！当前已到达dashboard页面")
         return True
@@ -520,7 +600,7 @@ def get_server_id(page):
 
         log("❌ 所有 URL 均未找到 Server ID")
         status = "❌ 未获取到server ID, 检查服务是否被删除"
-        send_telegram_notification(status)  # 发送 Telegram 通知 
+        send_message(status)  # 发送 Telegram 通知 
         return None
     except Exception as e:
         log(f"❌ 获取 Server ID 失败: {e}")
@@ -706,7 +786,7 @@ def main():
                 status = "✅ 续期成功"
 
             # 发送 Telegram 通知
-            send_telegram_notification(status, old_due, new_due, current_ip)
+            send_message(status, old_due, new_due, current_ip)
 
             if renew_result == "NOT_TIME":
                 sys.exit(0)
